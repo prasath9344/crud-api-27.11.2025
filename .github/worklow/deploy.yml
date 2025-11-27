@@ -1,0 +1,144 @@
+name: Deploy 2ndcareers-dev-api to AWS ECS Fargate
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "crud-api"
+        default: "dev"
+permissions:
+  id-token: write
+  contents: read
+env:
+  AWS_REGION: us-east-1 # set this to your preferred AWS region, e.g. us-west-1
+  ECR_REPOSITORY: crud-api # set this to your Amazon ECR repository name
+  ECS_SERVICE: crud-service # set this to your Amazon ECS service name
+  ECS_CLUSTER: crud-api-cluster # set this to your Amazon ECS cluster name
+  ECS_TASK_DEFINITION:
+    crud-api-task # set this to the path to your Amazon ECS task definition
+    # file, e.g. .aws/task-definition.json
+  CONTAINER_NAME:
+    crud-container # set this to the name of the container in the
+    # containerDefinitions section of your task definition
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    environment: dev
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          audience: sts.amazonaws.com
+          aws-region: us-east-1
+          role-to-assume: arn:aws:iam::575327645493:role/crud-api-ecs
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Check if Log Group exists
+        id: check_log_group
+        run: |
+          log_group_name="2ndcareers_api_dev"
+          existing_log_groups=$(aws logs describe-log-groups --log-group-name-prefix "$log_group_name" --query "logGroups[*].logGroupName" --output text)
+          if [[ -z "$existing_log_groups" ]]; then
+            echo "Log group does not exist"
+            echo "::set-output name=log_group_exists::false"
+          else
+            echo "Log group already exists"
+            echo "::set-output name=log_group_exists::true"
+          fi
+
+      - name: Create log group
+        if: steps.check_log_group.outputs.log_group_exists == 'false'
+        run: |
+          aws logs create-log-group --log-group-name 2ndcareers_api_dev
+
+      - name: Register task definition
+        run: |
+          aws ecs register-task-definition --region us-east-1 --cli-input-json file://2ndcareers-api-task.json
+
+      - name: Create an ECS Cluster
+        run: |
+          aws ecs create-cluster --region us-east-1  --cluster-name $ECS_CLUSTER
+
+      - name: Check if Fargate Service Exists
+        id: check_service
+        run: |
+          result=$(aws ecs describe-services --region us-east-1 --cluster $ECS_CLUSTER --services $ECS_SERVICE | jq '.services | length')
+          echo $result
+          if [[ $result -gt 0 ]]; then
+            echo "Fargate service already exists, skipping creation."
+            echo "::set-output name=fg_service_exists::true"
+          else          
+            echo "Fargate service does not exist, proceeding with creation."
+            echo "::set-output name=fg_service_exists::false"
+          fi
+
+      - name: Create a Fargate service
+        if: steps.check_service.outputs.fg_service_exists == 'false'
+        run: |
+          aws ecs create-service --region us-east-1 --cluster $ECS_CLUSTER --service-name $ECS_SERVICE --task-definition 2ndcareers-api-task --desired-count 1 --launch-type "FARGATE" --network-configuration "awsvpcConfiguration={subnets=[subnet-0c3d54b68c3dd192d,subnet-0e975e940b018bd6e,subnet-02b7d9bfd78ee4aad,subnet-06d04d5927a925b49,subnet-0470de729daf28ff0,subnet-0d2cf09b23d12f6f8],securityGroups=[sg-09607412de4b48121],assignPublicIp=ENABLED}" --load-balancers='[{"targetGroupArn": "arn:aws:elasticloadbalancing:us-east-1:045539354960:targetgroup/2ndcareers-grp-80/775b975ed580eaee", "containerName": "2ndcareers", "containerPort": 80 }]'
+
+      - name: Create a Capacity Provider
+        run: |
+          aws ecs put-cluster-capacity-providers --cluster $ECS_CLUSTER --capacity-providers FARGATE FARGATE_SPOT --default-capacity-provider-strategy capacityProvider=FARGATE,weight=1,base=1 capacityProvider=FARGATE_SPOT,weight=4
+
+      - name: Register the Scalable Target
+        run: |
+          aws application-autoscaling register-scalable-target --service-namespace ecs --resource-id service/$ECS_CLUSTER/$ECS_SERVICE --scalable-dimension ecs:service:DesiredCount --min-capacity 1 --max-capacity 3
+
+      - name: Define Target Tracking Scaling Policy
+        run: |
+          aws application-autoscaling put-scaling-policy --service-namespace ecs --resource-id service/$ECS_CLUSTER/$ECS_SERVICE --scalable-dimension ecs:service:DesiredCount --policy-name 2ndcareers-dev-api-autoscale --policy-type TargetTrackingScaling --target-tracking-scaling-policy-configuration file://cpu-scaling-policy.json
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Build a docker container and
+          # push it to ECR so that it can
+          # be deployed to ECS.
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Fill in the new image ID in the Amazon ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.ECS_TASK_DEFINITION }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      - name: Add environment variables to ECS task definition
+        id: add-env-var
+        uses: cvmaker-bv/amazon-ecs-task-environment@v1
+        env:
+        PROFESSIONAL_TRIAL_PERIOD: ${{secrets.PROFESSIONAL_TRIAL_PERIOD}}
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_USER: ${{ secrets.MYSQL_USER }}
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          MYSQL_DB: ${{ secrets.MYSQL_DB }}
+         
+
+
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          env-variables: "${{ toJson(env) }}"
+
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.add-env-var.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
